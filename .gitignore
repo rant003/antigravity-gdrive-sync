@@ -1,0 +1,10 @@
+# Never commit private Antigravity conversation data or machine metadata
+data/
+sync_meta.json
+last_cloud_sync.json
+*.db
+*.db-wal
+*.db-shm
+*.pb
+*.pbtxt
+_robocopy_test/
