@@ -106,30 +106,158 @@ function Invoke-MirrorDir {
     }
 }
 
-function Sync-RootFiles {
+function Get-SqliteEffectiveMtimeUtc {
     param(
-        [string]$SourceRoot,
-        [string]$DestRoot
+        [string]$Dir,
+        [string]$DbFileName
     )
-    if (-not (Test-Path $DestRoot)) {
-        New-Item -ItemType Directory -Path $DestRoot -Force | Out-Null
+    $dbPath = Join-Path $Dir $DbFileName
+    if (-not (Test-Path $dbPath)) {
+        return $null
     }
-    foreach ($walFile in @("conversation_summaries.db-wal", "conversation_summaries.db-shm")) {
-        $targetWal = Join-Path $DestRoot $walFile
-        if (Test-Path $targetWal) {
-            Remove-Item -Path $targetWal -Force -ErrorAction SilentlyContinue
+    $latest = (Get-Item -Path $dbPath).LastWriteTimeUtc
+    $walPath = Join-Path $Dir ($DbFileName + "-wal")
+    if (Test-Path $walPath) {
+        $walItem = Get-Item -Path $walPath
+        if ($walItem.Length -gt 0 -and $walItem.LastWriteTimeUtc -gt $latest) {
+            $latest = $walItem.LastWriteTimeUtc
         }
     }
-    foreach ($fileName in $SyncFiles) {
-        $srcFile = Join-Path $SourceRoot $fileName
-        if (Test-Path $srcFile) {
-            $dstFile = Join-Path $DestRoot $fileName
-            Copy-Item -Path $srcFile -Destination $dstFile -Force
+    return $latest
+}
+
+function Copy-SqliteClean {
+    param(
+        [string]$SrcDir,
+        [string]$DstDir,
+        [string]$DbFileName,
+        [string]$PythonExe
+    )
+    if (-not (Test-Path $DstDir)) {
+        New-Item -ItemType Directory -Path $DstDir -Force | Out-Null
+    }
+    $srcDb = Join-Path $SrcDir $DbFileName
+    if (-not (Test-Path $srcDb)) {
+        return
+    }
+    $dstDb = Join-Path $DstDir $DbFileName
+    $srcWal = Join-Path $SrcDir ($DbFileName + "-wal")
+    $srcShm = Join-Path $SrcDir ($DbFileName + "-shm")
+
+    foreach ($suffix in @("-wal", "-shm")) {
+        $stale = Join-Path $DstDir ($DbFileName + $suffix)
+        if (Test-Path $stale) {
+            Remove-Item -Path $stale -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $hasWalData = (Test-Path $srcWal) -and ((Get-Item -Path $srcWal).Length -gt 0)
+    if ($hasWalData -and $PythonExe) {
+        $tmpDir = Join-Path $env:TEMP ("agy_sqlite_" + [guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+        try {
+            $tmpDb = Join-Path $tmpDir $DbFileName
+            Copy-Item -Path $srcDb -Destination $tmpDb -Force
+            Copy-Item -Path $srcWal -Destination ($tmpDb + "-wal") -Force
+            if (Test-Path $srcShm) {
+                Copy-Item -Path $srcShm -Destination ($tmpDb + "-shm") -Force
+            }
+            $pyCheck = "import sqlite3, sys; con = sqlite3.connect(sys.argv[1]); con.execute('PRAGMA wal_checkpoint(TRUNCATE);'); integ = con.execute('PRAGMA integrity_check;').fetchone()[0]; con.close(); sys.exit(0 if integ == 'ok' else 1)"
+            $errOut = & $PythonExe -c $pyCheck $tmpDb 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "SQLite WAL checkpoint 失败 ($srcDb): $errOut"
+            }
+            Copy-Item -Path $tmpDb -Destination $dstDb -Force
+        }
+        finally {
+            Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    else {
+        Copy-Item -Path $srcDb -Destination $dstDb -Force
+        if ($hasWalData) {
+            Copy-Item -Path $srcWal -Destination ($dstDb + "-wal") -Force
+            if (Test-Path $srcShm) {
+                Copy-Item -Path $srcShm -Destination ($dstDb + "-shm") -Force
+            }
         }
     }
 }
 
-function Sync-DataDirection {
+function Merge-SummaryDatabase {
+    param(
+        [string]$SrcRoot,
+        [string]$DstRoot
+    )
+    $srcSumDb = Join-Path $SrcRoot "conversation_summaries.db"
+    if (-not (Test-Path $srcSumDb)) {
+        return "无源索引库"
+    }
+    if (-not (Test-Path $DstRoot)) {
+        New-Item -ItemType Directory -Path $DstRoot -Force | Out-Null
+    }
+    $dstSumDb = Join-Path $DstRoot "conversation_summaries.db"
+    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    $pythonExe = if ($pythonCmd) { $pythonCmd.Source } else { $null }
+    $mergePy = Join-Path $CloudRoot "merge_summaries.py"
+
+    if ((Test-Path $dstSumDb) -and $pythonExe -and (Test-Path $mergePy)) {
+        $tmpDir = Join-Path $env:TEMP ("agy_sum_merge_" + [guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+        try {
+            $tmpSrc = Join-Path $tmpDir "src.db"
+            $tmpDst = Join-Path $tmpDir "dst.db"
+
+            Copy-Item -Path $srcSumDb -Destination $tmpSrc -Force
+            foreach ($suffix in @("-wal", "-shm")) {
+                $sFile = $srcSumDb + $suffix
+                if (Test-Path $sFile) { Copy-Item -Path $sFile -Destination ($tmpSrc + $suffix) -Force }
+            }
+
+            Copy-Item -Path $dstSumDb -Destination $tmpDst -Force
+            foreach ($suffix in @("-wal", "-shm")) {
+                $dFile = $dstSumDb + $suffix
+                if (Test-Path $dFile) { Copy-Item -Path $dFile -Destination ($tmpDst + $suffix) -Force }
+            }
+
+            $mergeOut = & $pythonExe $mergePy $tmpSrc $tmpDst 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "merge_summaries.py 失败: $mergeOut"
+            }
+
+            $pyVerify = "import sqlite3, sys; con = sqlite3.connect(sys.argv[1]); con.execute('PRAGMA wal_checkpoint(TRUNCATE);'); integ = con.execute('PRAGMA integrity_check;').fetchone()[0]; con.close(); sys.exit(0 if integ == 'ok' else 1)"
+            $verifyOut = & $pythonExe -c $pyVerify $tmpDst 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "索引库完整性校验失败: $verifyOut"
+            }
+
+            foreach ($suffix in @("-wal", "-shm")) {
+                $stale = $dstSumDb + $suffix
+                if (Test-Path $stale) { Remove-Item -Path $stale -Force -ErrorAction SilentlyContinue }
+            }
+            Copy-Item -Path $tmpDst -Destination $dstSumDb -Force
+            return ($mergeOut -join " ").Trim()
+        }
+        finally {
+            Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    elseif (-not (Test-Path $dstSumDb)) {
+        Copy-SqliteClean -SrcDir $SrcRoot -DstDir $DstRoot -DbFileName "conversation_summaries.db" -PythonExe $pythonExe
+        return "初始化索引库"
+    }
+    else {
+        $srcMtime = Get-SqliteEffectiveMtimeUtc -Dir $SrcRoot -DbFileName "conversation_summaries.db"
+        $dstMtime = Get-SqliteEffectiveMtimeUtc -Dir $DstRoot -DbFileName "conversation_summaries.db"
+        if ($srcMtime -and ((-not $dstMtime) -or ($srcMtime -gt $dstMtime.AddSeconds(2)))) {
+            Copy-SqliteClean -SrcDir $SrcRoot -DstDir $DstRoot -DbFileName "conversation_summaries.db" -PythonExe $pythonExe
+            return "无 Python 环境，按最新时间覆盖"
+        }
+        return "索引库无需更新"
+    }
+}
+
+function Sync-DataMerge {
     param(
         [string]$SourceRoot,
         [string]$DestRoot
@@ -137,12 +265,76 @@ function Sync-DataDirection {
     if (-not (Test-Path $DestRoot)) {
         New-Item -ItemType Directory -Path $DestRoot -Force | Out-Null
     }
-    foreach ($dirName in $SyncDirs) {
-        $src = Join-Path $SourceRoot $dirName
-        $dst = Join-Path $DestRoot $dirName
-        Invoke-MirrorDir -SourceDir $src -DestDir $dst
+    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    $pythonExe = if ($pythonCmd) { $pythonCmd.Source } else { $null }
+
+    # 1. conversations/*.db (additive newest-wins, never deletes destination-only chats)
+    $srcConvDir = Join-Path $SourceRoot "conversations"
+    $dstConvDir = Join-Path $DestRoot "conversations"
+    $convAdded = 0
+    $convUpdated = 0
+    if (Test-Path $srcConvDir) {
+        if (-not (Test-Path $dstConvDir)) {
+            New-Item -ItemType Directory -Path $dstConvDir -Force | Out-Null
+        }
+        $srcDbs = @(Get-ChildItem -Path $srcConvDir -Filter "*.db" -File -ErrorAction SilentlyContinue)
+        foreach ($srcDb in $srcDbs) {
+            $srcMtime = Get-SqliteEffectiveMtimeUtc -Dir $srcConvDir -DbFileName $srcDb.Name
+            $dstMtime = Get-SqliteEffectiveMtimeUtc -Dir $dstConvDir -DbFileName $srcDb.Name
+            if (-not $dstMtime) {
+                Copy-SqliteClean -SrcDir $srcConvDir -DstDir $dstConvDir -DbFileName $srcDb.Name -PythonExe $pythonExe
+                $convAdded++
+            }
+            elseif ($srcMtime -gt $dstMtime.AddSeconds(2)) {
+                Copy-SqliteClean -SrcDir $srcConvDir -DstDir $dstConvDir -DbFileName $srcDb.Name -PythonExe $pythonExe
+                $convUpdated++
+            }
+        }
     }
-    Sync-RootFiles -SourceRoot $SourceRoot -DestRoot $DestRoot
+
+    # 2. annotations/ (additive newest-wins)
+    $srcAnnDir = Join-Path $SourceRoot "annotations"
+    $dstAnnDir = Join-Path $DestRoot "annotations"
+    if (Test-Path $srcAnnDir) {
+        if (-not (Test-Path $dstAnnDir)) {
+            New-Item -ItemType Directory -Path $dstAnnDir -Force | Out-Null
+        }
+        $annFiles = @(Get-ChildItem -Path $srcAnnDir -File -ErrorAction SilentlyContinue)
+        foreach ($af in $annFiles) {
+            $dstAnn = Join-Path $dstAnnDir $af.Name
+            if ((-not (Test-Path $dstAnn)) -or ($af.LastWriteTimeUtc -gt (Get-Item -Path $dstAnn).LastWriteTimeUtc.AddSeconds(2))) {
+                Copy-Item -Path $af.FullName -Destination $dstAnn -Force
+            }
+        }
+    }
+
+    # 3. brain/ (additive newest-wins via robocopy /E /XO, never /MIR or /PURGE)
+    $srcBrainDir = Join-Path $SourceRoot "brain"
+    $dstBrainDir = Join-Path $DestRoot "brain"
+    if (Test-Path $srcBrainDir) {
+        if (-not (Test-Path $dstBrainDir)) {
+            New-Item -ItemType Directory -Path $dstBrainDir -Force | Out-Null
+        }
+        & robocopy $srcBrainDir $dstBrainDir /E /XO /COPY:DT /FFT /R:3 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
+        $rcCode = $LASTEXITCODE
+        if ($rcCode -ge 8) {
+            throw "robocopy 合并 brain 目录失败 ($srcBrainDir -> $dstBrainDir), 退出码: $rcCode"
+        }
+    }
+
+    # 4. conversation_summaries.db (row-level SQLite merge)
+    $sumSummary = Merge-SummaryDatabase -SrcRoot $SourceRoot -DstRoot $DestRoot
+
+    # 5. agyhub_summaries_proto.pb (newest-wins)
+    $srcProto = Join-Path $SourceRoot "agyhub_summaries_proto.pb"
+    $dstProto = Join-Path $DestRoot "agyhub_summaries_proto.pb"
+    if (Test-Path $srcProto) {
+        if ((-not (Test-Path $dstProto)) -or ((Get-Item -Path $srcProto).LastWriteTimeUtc -gt (Get-Item -Path $dstProto).LastWriteTimeUtc.AddSeconds(2))) {
+            Copy-Item -Path $srcProto -Destination $dstProto -Force
+        }
+    }
+
+    Write-Host "同步详情: 对话新增 $convAdded 个, 更新 $convUpdated 个 | 索引库: $sumSummary" -ForegroundColor Gray
 }
 
 function Backup-LocalData {
@@ -214,12 +406,15 @@ function Show-Status {
     $running = @(Get-RunningAntigravityProcesses)
     $cloudMeta = Read-JsonFile -Path $CloudMetaPath
     $localMeta = Read-JsonFile -Path $LocalMetaPath
+    $localConvCount = @(Get-ChildItem -Path (Join-Path $LocalRoot "conversations") -Filter "*.db" -File -ErrorAction SilentlyContinue).Count
+    $cloudConvCount = @(Get-ChildItem -Path (Join-Path $CloudDataDir "conversations") -Filter "*.db" -File -ErrorAction SilentlyContinue).Count
 
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host "Antigravity Google Drive 同步状态" -ForegroundColor Cyan
     Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host "本地数据目录 : $LocalRoot"
-    Write-Host "云端同步目录 : $CloudDataDir"
+    Write-Host "同步模式     : 安全合并模式 (只增不减 + SQLite 索引合并)"
+    Write-Host "本地数据目录 : $LocalRoot ($localConvCount 个对话)"
+    Write-Host "云端同步目录 : $CloudDataDir ($cloudConvCount 个对话)"
     Write-Host "主程序路径   : $(if ($exe) { $exe } else { '未找到' })"
     Write-Host "当前运行状态 : $(if ($running.Count -gt 0) { "运行中 ($($running.Count) 个进程)" } else { '未运行' })"
     Write-Host ""
@@ -257,25 +452,24 @@ function Invoke-Upload {
 
     if ($cloudMeta -and ((-not $localMeta) -or ($cloudMeta.syncId -ne $localMeta.syncId))) {
         Write-Host ""
-        Write-Host "[警告] 云端数据较新或来自其他设备！" -ForegroundColor Yellow
-        Write-Host "云端最后上传设备: $($cloudMeta.machineName) ($($cloudMeta.userName))" -ForegroundColor Yellow
-        Write-Host "云端最后上传时间: $($cloudMeta.syncTimeLocal)" -ForegroundColor Yellow
-        $confirm = Read-Host "继续上传将覆盖云端记录，确认覆盖请输入 Y，其他键取消"
-        if ($confirm -notmatch "^[yY]$") {
+        Write-Host "[提示] 云端最新记录来自 $($cloudMeta.machineName) @ $($cloudMeta.syncTimeLocal)。" -ForegroundColor Yellow
+        Write-Host "将以「安全合并模式」上传，不会删除云端已有的对话记录。" -ForegroundColor Cyan
+        $confirm = Read-Host "是否继续安全合并上传？[Y/n]"
+        if (-not [string]::IsNullOrWhiteSpace($confirm) -and ($confirm -notmatch "^[yY]$")) {
             Write-Host "已取消上传。" -ForegroundColor Red
             return
         }
     }
 
-    Write-Host "正在同步本地对话到 Google Drive..." -ForegroundColor Cyan
-    Sync-DataDirection -SourceRoot $LocalRoot -DestRoot $CloudDataDir
+    Write-Host "正在以安全合并模式同步本地对话到云端..." -ForegroundColor Cyan
+    Sync-DataMerge -SourceRoot $LocalRoot -DestRoot $CloudDataDir
 
     $meta = New-SyncMetadata
     Write-JsonFile -Path $CloudMetaPath -Data $meta
     Write-JsonFile -Path $LocalMetaPath -Data $meta
 
     Write-Host ""
-    Write-Host "[成功] 对话记录已上传至云端目录！" -ForegroundColor Green
+    Write-Host "[成功] 对话记录已安全合并上传至云端目录！" -ForegroundColor Green
     Write-Host "同步时间: $($meta.syncTimeLocal) | Sync ID: $($meta.syncId)" -ForegroundColor Green
     Write-Host "提醒: 切换电脑前请确认右下角 Google Drive 托盘图标已显示同步完成。" -ForegroundColor Yellow
 }
@@ -290,13 +484,13 @@ function Invoke-Download {
     }
 
     Write-Host "正在自动备份本地数据..." -ForegroundColor Cyan
-    $backupPath = Backup-LocalData -Reason "before_download"
+    $backupPath = Backup-LocalData -Reason "before_download_merge"
     if ($backupPath) {
         Write-Host "本地备份已保存至: $backupPath" -ForegroundColor Gray
     }
 
-    Write-Host "正在从 Google Drive 下载对话到本地..." -ForegroundColor Cyan
-    Sync-DataDirection -SourceRoot $CloudDataDir -DestRoot $LocalRoot
+    Write-Host "正在以安全合并模式从云端拉取对话到本地..." -ForegroundColor Cyan
+    Sync-DataMerge -SourceRoot $CloudDataDir -DestRoot $LocalRoot
 
     if (Test-Path $CloudMetaPath) {
         Copy-Item -Path $CloudMetaPath -Destination $LocalMetaPath -Force
@@ -304,36 +498,28 @@ function Invoke-Download {
 
     $cloudMeta = Read-JsonFile -Path $CloudMetaPath
     Write-Host ""
-    Write-Host "[成功] 已从云端同步最新对话到本地！" -ForegroundColor Green
+    Write-Host "[成功] 已从云端安全合并最新对话到本地！" -ForegroundColor Green
     if ($cloudMeta) {
         Write-Host "同步来源: $($cloudMeta.machineName) | 上传时间: $($cloudMeta.syncTimeLocal)" -ForegroundColor Green
     }
 }
 
-function Test-LocalModifiedAfterSync {
-    param($LocalMeta)
-    $convDir = Join-Path $LocalRoot "conversations"
-    if (-not (Test-Path $convDir)) {
+function Test-CloudHasUpdates {
+    $cloudConvDir = Join-Path $CloudDataDir "conversations"
+    $localConvDir = Join-Path $LocalRoot "conversations"
+    if (-not (Test-Path $cloudConvDir)) {
         return $false
     }
-    $dbFiles = @(Get-ChildItem -Path $convDir -Filter "*.db" -File -ErrorAction SilentlyContinue)
-    if ($dbFiles.Count -eq 0) {
-        return $false
-    }
-    if (-not $LocalMeta -or -not $LocalMeta.syncTimeUtc) {
-        return $true
-    }
-    $files = @(Get-ChildItem -Path $convDir -File -ErrorAction SilentlyContinue)
-    try {
-        $lastSyncUtc = [datetime]::Parse($LocalMeta.syncTimeUtc).ToUniversalTime()
-        foreach ($f in $files) {
-            if ($f.LastWriteTimeUtc -gt $lastSyncUtc.AddSeconds(5)) {
-                return $true
-            }
+    $cloudDbs = @(Get-ChildItem -Path $cloudConvDir -Filter "*.db" -File -ErrorAction SilentlyContinue)
+    foreach ($cDb in $cloudDbs) {
+        $cMtime = Get-SqliteEffectiveMtimeUtc -Dir $cloudConvDir -DbFileName $cDb.Name
+        $lMtime = Get-SqliteEffectiveMtimeUtc -Dir $localConvDir -DbFileName $cDb.Name
+        if (-not $lMtime) {
+            return $true
         }
-    }
-    catch {
-        return $false
+        if ($cMtime -gt $lMtime.AddSeconds(2)) {
+            return $true
+        }
     }
     return $false
 }
@@ -357,33 +543,26 @@ function Invoke-Launch {
     $localMeta = Read-JsonFile -Path $LocalMetaPath
 
     if ((Test-Path $CloudDataDir) -and $cloudMeta) {
-        if ($localMeta -and ($cloudMeta.syncId -eq $localMeta.syncId)) {
-            Write-Host "本地已是最新同步版本（$($cloudMeta.syncTimeLocal)），直接启动 Antigravity..." -ForegroundColor Green
+        Write-Host "----------------------------------------------------------------" -ForegroundColor DarkCyan
+        Write-Host "云端最新记录: $($cloudMeta.machineName) ($($cloudMeta.userName)) @ $($cloudMeta.syncTimeLocal)" -ForegroundColor Cyan
+        if ($cloudMeta.machineName -eq $env:COMPUTERNAME) {
+            Write-Host "提示: 云端最新记录来自本机；若刚在另一台电脑用过却没看到对方记录，请先重启 Google Drive 刷新。" -ForegroundColor Yellow
+        }
+        Write-Host "----------------------------------------------------------------" -ForegroundColor DarkCyan
+
+        $needPull = (-not $localMeta) -or ($cloudMeta.syncId -ne $localMeta.syncId) -or (Test-CloudHasUpdates)
+        if (-not $needPull) {
+            Write-Host "本地已是最新同步版本，直接启动 Antigravity..." -ForegroundColor Green
         }
         else {
-            $shouldDownload = $true
-            if (Test-LocalModifiedAfterSync -LocalMeta $localMeta) {
-                Write-Host ""
-                Write-Host "[注意] 检测到云端和本地都有对话记录！" -ForegroundColor Yellow
-                Write-Host "云端最新: $($cloudMeta.machineName) 于 $($cloudMeta.syncTimeLocal)" -ForegroundColor Yellow
-                Write-Host "本地也存在未同步的对话文件（首次在新电脑同步或上次同步后有过修改）。" -ForegroundColor Yellow
-                Write-Host "提示: 如需把两台电脑的对话合并到一起，可先选 [N]，退出后运行 合并备份对话.bat。" -ForegroundColor Cyan
-                $choice = Read-Host "请选择: [Y] 用云端覆盖本地（会先自动备份本地） / [N] 保留本地直接启动"
-                if ($choice -notmatch "^[yY]$") {
-                    $shouldDownload = $false
-                    Write-Host "已选择保留本地数据，跳过下载。" -ForegroundColor Cyan
-                }
+            Write-Host "正在备份本地并安全合并云端对话（只增不减，不会丢失本机已有对话）..." -ForegroundColor Cyan
+            $backupPath = Backup-LocalData -Reason "before_launch_merge"
+            if ($backupPath) {
+                Write-Host "本地备份已保存至: $backupPath" -ForegroundColor Gray
             }
-            if ($shouldDownload) {
-                Write-Host "发现云端新版本（来自 $($cloudMeta.machineName)，时间 $($cloudMeta.syncTimeLocal)），正在备份并拉取..." -ForegroundColor Cyan
-                $backupPath = Backup-LocalData -Reason "before_launch_download"
-                if ($backupPath) {
-                    Write-Host "本地备份已保存至: $backupPath" -ForegroundColor Gray
-                }
-                Sync-DataDirection -SourceRoot $CloudDataDir -DestRoot $LocalRoot
-                Copy-Item -Path $CloudMetaPath -Destination $LocalMetaPath -Force
-                Write-Host "云端对话拉取完成！" -ForegroundColor Green
-            }
+            Sync-DataMerge -SourceRoot $CloudDataDir -DestRoot $LocalRoot
+            Copy-Item -Path $CloudMetaPath -Destination $LocalMetaPath -Force
+            Write-Host "云端对话安全合并完成！" -ForegroundColor Green
         }
     }
     else {
@@ -423,11 +602,11 @@ function Invoke-Launch {
     }
 
     Write-Host ""
-    Write-Host "检测到 Antigravity 已完全退出，等待 SQLite 落盘后自动上传..." -ForegroundColor Cyan
+    Write-Host "检测到 Antigravity 已完全退出，等待 SQLite 落盘后安全合并上传..." -ForegroundColor Cyan
     Start-Sleep -Seconds 2
 
     try {
-        Sync-DataDirection -SourceRoot $LocalRoot -DestRoot $CloudDataDir
+        Sync-DataMerge -SourceRoot $LocalRoot -DestRoot $CloudDataDir
         $meta = New-SyncMetadata
         Write-JsonFile -Path $CloudMetaPath -Data $meta
         Write-JsonFile -Path $LocalMetaPath -Data $meta
@@ -625,8 +804,8 @@ function Invoke-Merge {
     Write-Host "[成功] 合并完成！当前本地共有 $totalLocalDbs 个对话。" -ForegroundColor Green
     $upAns = Read-Host "是否立即将合并后的全部对话上传同步到 Google Drive？[Y/n]"
     if ([string]::IsNullOrWhiteSpace($upAns) -or $upAns -match "^[yY]$") {
-        Write-Host "正在上传合并后的全部对话到 Google Drive（首次上传约需几十秒，请耐心等待）..." -ForegroundColor Cyan
-        Sync-DataDirection -SourceRoot $LocalRoot -DestRoot $CloudDataDir
+        Write-Host "正在以安全合并模式上传全部对话到 Google Drive..." -ForegroundColor Cyan
+        Sync-DataMerge -SourceRoot $LocalRoot -DestRoot $CloudDataDir
         $meta = New-SyncMetadata
         Write-JsonFile -Path $CloudMetaPath -Data $meta
         Write-JsonFile -Path $LocalMetaPath -Data $meta
