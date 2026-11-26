@@ -1,5 +1,5 @@
 ﻿param(
-    [ValidateSet("launch", "upload", "download", "status", "shortcut")]
+    [ValidateSet("launch", "upload", "download", "status", "shortcut", "merge")]
     [string]$Mode = "status"
 )
 
@@ -169,11 +169,11 @@ function Backup-LocalData {
         }
     }
 
-    # Prune older backups, keep latest 5
+    # Prune older backups, keep latest 10
     if (Test-Path $BackupRoot) {
         $allBackups = Get-ChildItem -Path $BackupRoot -Directory | Sort-Object CreationTime -Descending
-        if ($allBackups.Count -gt 5) {
-            $allBackups | Select-Object -Skip 5 | ForEach-Object {
+        if ($allBackups.Count -gt 10) {
+            $allBackups | Select-Object -Skip 10 | ForEach-Object {
                 Remove-Item -Path $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
@@ -312,17 +312,18 @@ function Invoke-Download {
 
 function Test-LocalModifiedAfterSync {
     param($LocalMeta)
-    if (-not $LocalMeta -or -not $LocalMeta.syncTimeUtc) {
-        return $false
-    }
     $convDir = Join-Path $LocalRoot "conversations"
     if (-not (Test-Path $convDir)) {
         return $false
     }
-    $files = @(Get-ChildItem -Path $convDir -File -ErrorAction SilentlyContinue)
-    if ($files.Count -eq 0) {
+    $dbFiles = @(Get-ChildItem -Path $convDir -Filter "*.db" -File -ErrorAction SilentlyContinue)
+    if ($dbFiles.Count -eq 0) {
         return $false
     }
+    if (-not $LocalMeta -or -not $LocalMeta.syncTimeUtc) {
+        return $true
+    }
+    $files = @(Get-ChildItem -Path $convDir -File -ErrorAction SilentlyContinue)
     try {
         $lastSyncUtc = [datetime]::Parse($LocalMeta.syncTimeUtc).ToUniversalTime()
         foreach ($f in $files) {
@@ -363,9 +364,10 @@ function Invoke-Launch {
             $shouldDownload = $true
             if (Test-LocalModifiedAfterSync -LocalMeta $localMeta) {
                 Write-Host ""
-                Write-Host "[注意] 检测到云端和本地都有新的变动！" -ForegroundColor Yellow
+                Write-Host "[注意] 检测到云端和本地都有对话记录！" -ForegroundColor Yellow
                 Write-Host "云端最新: $($cloudMeta.machineName) 于 $($cloudMeta.syncTimeLocal)" -ForegroundColor Yellow
-                Write-Host "本地也有上次同步之后修改过的对话文件。" -ForegroundColor Yellow
+                Write-Host "本地也存在未同步的对话文件（首次在新电脑同步或上次同步后有过修改）。" -ForegroundColor Yellow
+                Write-Host "提示: 如需把两台电脑的对话合并到一起，可先选 [N]，退出后运行 合并备份对话.bat。" -ForegroundColor Cyan
                 $choice = Read-Host "请选择: [Y] 用云端覆盖本地（会先自动备份本地） / [N] 保留本地直接启动"
                 if ($choice -notmatch "^[yY]$") {
                     $shouldDownload = $false
@@ -467,10 +469,182 @@ function New-DesktopShortcut {
     Write-Host "指向目标: $($shortcut.TargetPath) $($shortcut.Arguments)" -ForegroundColor Gray
 }
 
+function Invoke-Merge {
+    if (-not (Wait-ForAntigravityExitInteractive)) {
+        return
+    }
+
+    Write-Host "等待 SQLite 写入落盘..." -ForegroundColor Gray
+    Start-Sleep -Seconds 2
+
+    if (-not (Test-Path $BackupRoot)) {
+        Write-Host "[错误] 未找到本地备份目录: $BackupRoot" -ForegroundColor Red
+        return
+    }
+
+    $backups = @(Get-ChildItem -Path $BackupRoot -Directory | Sort-Object CreationTime -Descending)
+    if ($backups.Count -eq 0) {
+        Write-Host "[错误] 备份目录中没有可用的备份。" -ForegroundColor Red
+        return
+    }
+
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "可用的本地备份列表（按时间从新到旧）" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $backups.Count; $i++) {
+        $bDir = $backups[$i]
+        $bConvDir = Join-Path $bDir.FullName "conversations"
+        $dbCount = if (Test-Path $bConvDir) { @(Get-ChildItem -Path $bConvDir -Filter "*.db" -File -ErrorAction SilentlyContinue).Count } else { 0 }
+        Write-Host ("  [{0}] {1}  ({2} 个对话)" -f ($i + 1), $bDir.Name, $dbCount)
+    }
+    Write-Host ""
+    $sel = Read-Host "请输入要合并的备份编号（直接按 [Enter] 默认选 1，输入 Q 取消）"
+    if ($sel -match "^[qQ]$") {
+        Write-Host "已取消合并。" -ForegroundColor Red
+        return
+    }
+    $idx = 0
+    if (-not [string]::IsNullOrWhiteSpace($sel)) {
+        if (-not [int]::TryParse($sel, [ref]$idx) -or $idx -lt 1 -or $idx -gt $backups.Count) {
+            Write-Host "[错误] 无效的编号: $sel" -ForegroundColor Red
+            return
+        }
+        $idx = $idx - 1
+    }
+    $selectedBackup = $backups[$idx]
+    Write-Host "已选择备份: $($selectedBackup.Name)" -ForegroundColor Cyan
+
+    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $pythonCmd) {
+        Write-Host "[错误] 未找到 python 命令，无法合并 conversation_summaries.db。" -ForegroundColor Red
+        return
+    }
+    $mergePy = Join-Path $CloudRoot "merge_summaries.py"
+    if (-not (Test-Path $mergePy)) {
+        Write-Host "[错误] 未找到合并脚本: $mergePy" -ForegroundColor Red
+        return
+    }
+
+    Write-Host "正在创建合并前安全快照..." -ForegroundColor Cyan
+    $preMergeBackup = Backup-LocalData -Reason "before_merge"
+    if ($preMergeBackup) {
+        Write-Host "快照已保存至: $preMergeBackup" -ForegroundColor Gray
+    }
+
+    if (-not (Test-Path $LocalRoot)) {
+        New-Item -ItemType Directory -Path $LocalRoot -Force | Out-Null
+    }
+
+    # 1. Merge conversations/*.db (+ -wal/-shm) additively
+    $srcConvDir = Join-Path $selectedBackup.FullName "conversations"
+    $dstConvDir = Join-Path $LocalRoot "conversations"
+    if (-not (Test-Path $dstConvDir)) {
+        New-Item -ItemType Directory -Path $dstConvDir -Force | Out-Null
+    }
+    if (Test-Path $srcConvDir) {
+        $srcDbs = @(Get-ChildItem -Path $srcConvDir -Filter "*.db" -File)
+        foreach ($srcDb in $srcDbs) {
+            $cid = [System.IO.Path]::GetFileNameWithoutExtension($srcDb.Name)
+            $dstDb = Join-Path $dstConvDir $srcDb.Name
+            $shouldCopy = $false
+            if (-not (Test-Path $dstDb)) {
+                $shouldCopy = $true
+            }
+            elseif ($srcDb.LastWriteTimeUtc -gt (Get-Item $dstDb).LastWriteTimeUtc) {
+                $shouldCopy = $true
+            }
+            if ($shouldCopy) {
+                foreach ($suffix in @("-wal", "-shm")) {
+                    $stale = Join-Path $dstConvDir ($cid + ".db" + $suffix)
+                    if (Test-Path $stale) {
+                        Remove-Item -Path $stale -Force -ErrorAction SilentlyContinue
+                    }
+                }
+                Copy-Item -Path $srcDb.FullName -Destination $dstDb -Force
+                foreach ($suffix in @("-wal", "-shm")) {
+                    $srcSidecar = Join-Path $srcConvDir ($cid + ".db" + $suffix)
+                    if (Test-Path $srcSidecar) {
+                        Copy-Item -Path $srcSidecar -Destination (Join-Path $dstConvDir ($cid + ".db" + $suffix)) -Force
+                    }
+                }
+            }
+        }
+    }
+
+    # 2. Merge annotations/ additively
+    $srcAnnDir = Join-Path $selectedBackup.FullName "annotations"
+    $dstAnnDir = Join-Path $LocalRoot "annotations"
+    if (Test-Path $srcAnnDir) {
+        if (-not (Test-Path $dstAnnDir)) {
+            New-Item -ItemType Directory -Path $dstAnnDir -Force | Out-Null
+        }
+        $annFiles = @(Get-ChildItem -Path $srcAnnDir -File)
+        foreach ($af in $annFiles) {
+            $dstAnn = Join-Path $dstAnnDir $af.Name
+            if ((-not (Test-Path $dstAnn)) -or ($af.LastWriteTimeUtc -gt (Get-Item $dstAnn).LastWriteTimeUtc)) {
+                Copy-Item -Path $af.FullName -Destination $dstAnn -Force
+            }
+        }
+    }
+
+    # 3. Merge brain/<id> subdirectories additively
+    $srcBrainDir = Join-Path $selectedBackup.FullName "brain"
+    $dstBrainDir = Join-Path $LocalRoot "brain"
+    if (Test-Path $srcBrainDir) {
+        if (-not (Test-Path $dstBrainDir)) {
+            New-Item -ItemType Directory -Path $dstBrainDir -Force | Out-Null
+        }
+        $brainSubs = @(Get-ChildItem -Path $srcBrainDir -Directory)
+        foreach ($sub in $brainSubs) {
+            $dstSub = Join-Path $dstBrainDir $sub.Name
+            if (-not (Test-Path $dstSub)) {
+                & robocopy $sub.FullName $dstSub /E /COPY:DT /FFT /R:3 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
+                if ($LASTEXITCODE -ge 8) {
+                    throw "robocopy 复制 brain 子目录失败 ($($sub.FullName) -> $dstSub), 退出码: $LASTEXITCODE"
+                }
+            }
+        }
+    }
+
+    # 4. Merge conversation_summaries.db
+    $backupSumDb = Join-Path $selectedBackup.FullName "conversation_summaries.db"
+    $localSumDb = Join-Path $LocalRoot "conversation_summaries.db"
+    if (Test-Path $backupSumDb) {
+        Write-Host "正在合并对话索引库 (conversation_summaries.db)..." -ForegroundColor Cyan
+        $mergeOutput = & python $mergePy $backupSumDb $localSumDb 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host $mergeOutput -ForegroundColor Red
+            throw "合并 conversation_summaries.db 失败，退出码: $LASTEXITCODE"
+        }
+        Write-Host "索引合并结果: $mergeOutput" -ForegroundColor Gray
+    }
+
+    $totalLocalDbs = @(Get-ChildItem -Path $dstConvDir -Filter "*.db" -File -ErrorAction SilentlyContinue).Count
+    Write-Host ""
+    Write-Host "[成功] 合并完成！当前本地共有 $totalLocalDbs 个对话。" -ForegroundColor Green
+    $upAns = Read-Host "是否立即将合并后的全部对话上传同步到 Google Drive？[Y/n]"
+    if ([string]::IsNullOrWhiteSpace($upAns) -or $upAns -match "^[yY]$") {
+        Write-Host "正在上传合并后的全部对话到 Google Drive（首次上传约需几十秒，请耐心等待）..." -ForegroundColor Cyan
+        Sync-DataDirection -SourceRoot $LocalRoot -DestRoot $CloudDataDir
+        $meta = New-SyncMetadata
+        Write-JsonFile -Path $CloudMetaPath -Data $meta
+        Write-JsonFile -Path $LocalMetaPath -Data $meta
+        Write-Host ""
+        Write-Host "[成功] 合并后的全部对话已上传至云端！" -ForegroundColor Green
+        Write-Host "同步时间: $($meta.syncTimeLocal) | Sync ID: $($meta.syncId)" -ForegroundColor Green
+        Write-Host "提醒: 切换电脑前请确认右下角 Google Drive 托盘图标已完成上传。" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "已跳过上传。稍后可随时运行 手动上传到云端.bat 上传到云端。" -ForegroundColor Yellow
+    }
+}
+
 switch ($Mode) {
     "status" { Show-Status }
     "upload" { Invoke-Upload }
     "download" { Invoke-Download }
     "launch" { Invoke-Launch }
     "shortcut" { New-DesktopShortcut }
+    "merge" { Invoke-Merge }
 }
